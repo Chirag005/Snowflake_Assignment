@@ -1,0 +1,288 @@
+USE DATABASE PLANNING_DB;
+USE WAREHOUSE COMPUTE_WH;
+USE SCHEMA PLANNING;
+
+CREATE OR REPLACE PROCEDURE PLANNING.USP_PROCESSBUDGETCONSOLIDATION (
+    SOURCE_BUDGET_HEADER_ID     INTEGER,
+    P_TARGET_BUDGET_HEADER_ID   INTEGER   DEFAULT NULL,
+    CONSOLIDATION_TYPE          VARCHAR   DEFAULT 'FULL',
+    INCLUDE_ELIMINATIONS        BOOLEAN   DEFAULT TRUE,
+    RECALCULATE_ALLOCATIONS     BOOLEAN   DEFAULT TRUE,
+    PROCESSING_OPTIONS          VARIANT   DEFAULT NULL,
+    USER_ID                     INTEGER   DEFAULT NULL,
+    DEBUG_MODE                  BOOLEAN   DEFAULT FALSE
+)
+RETURNS VARIANT
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    v_proc_start        TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
+    v_consolidation_run VARCHAR       := UUID_STRING();
+    v_target_id         INTEGER;
+    v_rows_processed    INTEGER       := 0;
+    v_batch_rows        INTEGER       := 0;
+    v_include_zeros     BOOLEAN       := FALSE;
+    v_rounding_prec     INTEGER;
+    v_final_expr        VARCHAR       := 'CONSOLIDATEDAMOUNT - ELIMINATIONAMOUNT';
+    v_where_clause      VARCHAR       := 'CONSOLIDATEDAMOUNT <> 0 OR ELIMINATIONAMOUNT <> 0';
+
+BEGIN
+    LET v_source_exists INTEGER := (
+        SELECT COUNT(*) FROM PLANNING.BUDGETHEADER
+        WHERE BUDGETHEADERID = :SOURCE_BUDGET_HEADER_ID
+    );
+
+    IF (v_source_exists = 0) THEN
+        RETURN OBJECT_CONSTRUCT(
+            'STATUS',                  'ERROR',
+            'ERROR_MESSAGE',           'Source budget header not found: ' || SOURCE_BUDGET_HEADER_ID::VARCHAR,
+            'TARGET_BUDGET_HEADER_ID', NULL,
+            'ROWS_PROCESSED',          0
+        )::VARIANT;
+    END IF;
+
+    LET v_source_status VARCHAR := (
+        SELECT STATUSCODE FROM PLANNING.BUDGETHEADER
+        WHERE BUDGETHEADERID = :SOURCE_BUDGET_HEADER_ID
+    );
+
+    IF (v_source_status NOT IN ('APPROVED', 'LOCKED')) THEN
+        RETURN OBJECT_CONSTRUCT(
+            'STATUS',                  'ERROR',
+            'ERROR_MESSAGE',           'Source budget must be APPROVED or LOCKED. Current status: ' || v_source_status,
+            'TARGET_BUDGET_HEADER_ID', NULL,
+            'ROWS_PROCESSED',          0
+        )::VARIANT;
+    END IF;
+
+    BEGIN TRANSACTION;
+
+    IF (P_TARGET_BUDGET_HEADER_ID IS NULL) THEN
+        INSERT INTO PLANNING.BUDGETHEADER (
+            BUDGETCODE, BUDGETNAME, BUDGETTYPE, SCENARIOTYPE, FISCALYEAR,
+            STARTPERIODID, ENDPERIODID, BASEBUDGETHEADERID, STATUSCODE,
+            VERSIONNUMBER, EXTENDEDPROPERTIES
+        )
+        SELECT
+            BUDGETCODE || '_CONSOL_' || TO_CHAR(CURRENT_DATE(), 'YYYYMMDD'),
+            BUDGETNAME || ' - Consolidated',
+            'CONSOLIDATED',
+            SCENARIOTYPE,
+            FISCALYEAR,
+            STARTPERIODID,
+            ENDPERIODID,
+            BUDGETHEADERID,
+            'DRAFT',
+            1,
+            OBJECT_CONSTRUCT(
+                'ConsolidationRun', OBJECT_CONSTRUCT(
+                    'RunID',      :v_consolidation_run,
+                    'SourceID',   :SOURCE_BUDGET_HEADER_ID,
+                    'Timestamp',  TO_CHAR(:v_proc_start, 'YYYY-MM-DD"T"HH24:MI:SS')
+                ),
+                'ConsolidationType', :CONSOLIDATION_TYPE
+            )
+        FROM PLANNING.BUDGETHEADER
+        WHERE BUDGETHEADERID = :SOURCE_BUDGET_HEADER_ID;
+
+        v_target_id := (
+            SELECT MAX(BUDGETHEADERID)
+            FROM PLANNING.BUDGETHEADER
+            WHERE BUDGETCODE LIKE '%_CONSOL_%'
+              AND BASEBUDGETHEADERID = :SOURCE_BUDGET_HEADER_ID
+        );
+
+        IF (v_target_id IS NULL) THEN
+            ROLLBACK;
+            RETURN OBJECT_CONSTRUCT(
+                'STATUS',                  'ERROR',
+                'ERROR_MESSAGE',           'Failed to create target budget header',
+                'TARGET_BUDGET_HEADER_ID', NULL,
+                'ROWS_PROCESSED',          0
+            )::VARIANT;
+        END IF;
+    ELSE
+        v_target_id := P_TARGET_BUDGET_HEADER_ID;
+    END IF;
+
+    CREATE TEMPORARY TABLE IF NOT EXISTS TEMP_CONSOLIDATION_WRK (
+        GLACCOOUNTID       INTEGER      NOT NULL,
+        COSTCENTERID       INTEGER      NOT NULL,
+        FISCALPERIODID     INTEGER      NOT NULL,
+        CONSOLIDATEDAMOUNT NUMBER(19,4) NOT NULL,
+        ELIMINATIONAMOUNT  NUMBER(19,4) NOT NULL DEFAULT 0,
+        FINALAMOUNT        NUMBER(19,4),
+        SOURCECOUNT        INTEGER,
+        PRIMARY KEY (GLACCOOUNTID, COSTCENTERID, FISCALPERIODID)
+    );
+
+    TRUNCATE TABLE TEMP_CONSOLIDATION_WRK;
+
+    CREATE OR REPLACE TEMPORARY TABLE TEMP_CC_HIERARCHY AS
+    WITH RECURSIVE CC_HIER AS (
+        SELECT CC.COSTCENTERID, CC.PARENTCOSTCENTERID, CC.HIERARCHYLEVEL
+        FROM PLANNING.COSTCENTER CC
+
+        UNION ALL
+
+        SELECT PARENT.COSTCENTERID, PARENT.PARENTCOSTCENTERID, PARENT.HIERARCHYLEVEL
+        FROM PLANNING.COSTCENTER PARENT
+        INNER JOIN CC_HIER CHILD ON PARENT.COSTCENTERID = CHILD.PARENTCOSTCENTERID
+    )
+    SELECT * FROM CC_HIER;
+
+    INSERT INTO TEMP_CONSOLIDATION_WRK (
+        GLACCOOUNTID, COSTCENTERID, FISCALPERIODID,
+        CONSOLIDATEDAMOUNT, SOURCECOUNT
+    )
+    SELECT
+        DA.GLACCOOUNTID,
+        H.COSTCENTERID,
+        DA.FISCALPERIODID,
+        SUM(DA.AMOUNT),
+        SUM(DA.SOURCECNT)
+    FROM (
+        SELECT
+            BLI.GLACCOOUNTID,
+            BLI.COSTCENTERID,
+            BLI.FISCALPERIODID,
+            SUM(NVL(BLI.FINALAMOUNT, BLI.ORIGINALAMOUNT + BLI.ADJUSTEDAMOUNT)) AS AMOUNT,
+            COUNT(*) AS SOURCECNT
+        FROM PLANNING.BUDGETLINEITEM BLI
+        WHERE BLI.BUDGETHEADERID = :SOURCE_BUDGET_HEADER_ID
+        GROUP BY BLI.GLACCOOUNTID, BLI.COSTCENTERID, BLI.FISCALPERIODID
+    ) DA
+    INNER JOIN TEMP_CC_HIERARCHY H
+        ON H.COSTCENTERID = DA.COSTCENTERID
+        OR H.PARENTCOSTCENTERID = DA.COSTCENTERID
+    GROUP BY DA.GLACCOOUNTID, H.COSTCENTERID, DA.FISCALPERIODID;
+
+    DROP TABLE IF EXISTS TEMP_CC_HIERARCHY;
+
+    v_rows_processed := v_rows_processed + SQLROWCOUNT;
+
+    IF (INCLUDE_ELIMINATIONS) THEN
+        MERGE INTO TEMP_CONSOLIDATION_WRK AS TGT
+        USING (
+            SELECT
+                E1.GLACCOOUNTID,
+                E1.COSTCENTERID,
+                E1.FISCALPERIODID,
+                E1.CONSOLIDATEDAMOUNT AS ELIMAMT
+            FROM TEMP_CONSOLIDATION_WRK E1
+            INNER JOIN PLANNING.GLACCOUNT GLA ON E1.GLACCOOUNTID = GLA.GLACCOOUNTID
+            INNER JOIN TEMP_CONSOLIDATION_WRK E2
+                ON  E1.GLACCOOUNTID       = E2.GLACCOOUNTID
+                AND E1.FISCALPERIODID     = E2.FISCALPERIODID
+                AND E1.COSTCENTERID      <> E2.COSTCENTERID
+                AND E1.CONSOLIDATEDAMOUNT = -E2.CONSOLIDATEDAMOUNT
+            WHERE GLA.INTERCOMPANYFLAG = TRUE
+        ) AS SRC
+        ON  TGT.GLACCOOUNTID   = SRC.GLACCOOUNTID
+        AND TGT.COSTCENTERID   = SRC.COSTCENTERID
+        AND TGT.FISCALPERIODID = SRC.FISCALPERIODID
+        WHEN MATCHED THEN
+            UPDATE SET TGT.ELIMINATIONAMOUNT = SRC.ELIMAMT;
+    END IF;
+
+    IF (RECALCULATE_ALLOCATIONS) THEN
+        IF (PROCESSING_OPTIONS IS NOT NULL) THEN
+            v_include_zeros := NVL(PROCESSING_OPTIONS:IncludeZeroBalances::BOOLEAN, FALSE);
+            v_rounding_prec := PROCESSING_OPTIONS:RoundingPrecision::INTEGER;
+        END IF;
+
+        IF (v_rounding_prec IS NOT NULL) THEN
+            v_final_expr := 'ROUND(CONSOLIDATEDAMOUNT - ELIMINATIONAMOUNT, ' || v_rounding_prec::VARCHAR || ')';
+        END IF;
+
+        IF (NOT v_include_zeros) THEN
+            v_where_clause := v_where_clause || ' AND (' || v_final_expr || ') <> 0';
+        END IF;
+
+        EXECUTE IMMEDIATE
+            'UPDATE TEMP_CONSOLIDATION_WRK '
+            || 'SET FINALAMOUNT = ' || v_final_expr
+            || ' WHERE '           || v_where_clause;
+
+        v_batch_rows := SQLROWCOUNT;
+    ELSE
+        UPDATE TEMP_CONSOLIDATION_WRK
+        SET FINALAMOUNT = CONSOLIDATEDAMOUNT - ELIMINATIONAMOUNT
+        WHERE CONSOLIDATEDAMOUNT <> 0 OR ELIMINATIONAMOUNT <> 0;
+
+        v_batch_rows := SQLROWCOUNT;
+    END IF;
+
+    INSERT INTO PLANNING.BUDGETLINEITEM (
+        BUDGETHEADERID, GLACCOOUNTID, COSTCENTERID, FISCALPERIODID,
+        ORIGINALAMOUNT, ADJUSTEDAMOUNT, FINALAMOUNT,
+        SPREADMETHODCODE, SOURCESYSTEM, SOURCEREFERENCE,
+        ISALLOCATED, LASTMODIFIEDBYUSERID, LASTMODIFIEDDATETIME
+    )
+    SELECT
+        :v_target_id,
+        WRK.GLACCOOUNTID,
+        WRK.COSTCENTERID,
+        WRK.FISCALPERIODID,
+        WRK.FINALAMOUNT,
+        0,
+        WRK.FINALAMOUNT,
+        'CONSOLIDATED',
+        'CONSOLIDATION_PROC',
+        :v_consolidation_run,
+        FALSE,
+        :USER_ID,
+        CURRENT_TIMESTAMP()
+    FROM TEMP_CONSOLIDATION_WRK WRK
+    WHERE WRK.FINALAMOUNT IS NOT NULL;
+
+    v_rows_processed := v_rows_processed + SQLROWCOUNT;
+
+    COMMIT;
+
+    IF (DEBUG_MODE) THEN
+        LET v_debug_rows VARIANT := (
+            SELECT ARRAY_AGG(
+                OBJECT_CONSTRUCT(
+                    'GLACCOOUNTID',       GLACCOOUNTID,
+                    'COSTCENTERID',       COSTCENTERID,
+                    'FISCALPERIODID',     FISCALPERIODID,
+                    'CONSOLIDATEDAMOUNT', CONSOLIDATEDAMOUNT,
+                    'ELIMINATIONAMOUNT',  ELIMINATIONAMOUNT,
+                    'FINALAMOUNT',        FINALAMOUNT
+                )
+            )
+            FROM TEMP_CONSOLIDATION_WRK
+        );
+
+        RETURN OBJECT_CONSTRUCT(
+            'STATUS',                  'COMPLETED',
+            'TARGET_BUDGET_HEADER_ID', v_target_id,
+            'ROWS_PROCESSED',          v_rows_processed,
+            'ERROR_MESSAGE',           NULL,
+            'CONSOLIDATION_RUN_ID',    v_consolidation_run,
+            'DEBUG_WORKSPACE',         v_debug_rows
+        )::VARIANT;
+    END IF;
+
+    RETURN OBJECT_CONSTRUCT(
+        'STATUS',                  'COMPLETED',
+        'TARGET_BUDGET_HEADER_ID', v_target_id,
+        'ROWS_PROCESSED',          v_rows_processed,
+        'ERROR_MESSAGE',           NULL,
+        'CONSOLIDATION_RUN_ID',    v_consolidation_run
+    )::VARIANT;
+
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        DROP TABLE IF EXISTS TEMP_CONSOLIDATION_WRK;
+        RETURN OBJECT_CONSTRUCT(
+            'STATUS',                  'ERROR',
+            'TARGET_BUDGET_HEADER_ID', NULL,
+            'ROWS_PROCESSED',          v_rows_processed,
+            'ERROR_MESSAGE',           SQLERRM
+        )::VARIANT;
+END;
+$$;
